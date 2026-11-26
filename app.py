@@ -30,11 +30,12 @@ with st.sidebar:
     st.caption("১০০% ফ্রি ও API Key মুক্ত ডিজিটাল স্বাস্থ্য সহায়ক")
     st.divider()
 
-    st.subheader("⚙️ AI স্ট্যাটাস")
+       st.subheader("⚙️ AI স্ট্যাটাস")
     if is_ollama_running():
-        st.success("🟢 Local Ollama Vision AI সক্রিয়")
+        st.success("🟢 Cloud Vision AI সক্রিয়")
     else:
-        st.warning("🟠 Ollama চালু নেই (`ollama serve` চালু করুন)")
+        st.warning("🟠 AI API Key সেট করা নেই")
+
 
     st.divider()
     st.error(
