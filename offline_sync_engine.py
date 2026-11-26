@@ -1,56 +1,35 @@
 import io
+import os
 import re
 import json
-import difflib
+import streamlit as st
 from PIL import Image, ImageOps
+from google import genai
+from google.genai import types
 
-try:
-    import ollama
-    OLLAMA_AVAILABLE = True
-except ImportError:
-    OLLAMA_AVAILABLE = False
+
+def _get_gemini_client():
+    """Retrieves Gemini API key from Streamlit Secrets or Environment Variables."""
+    api_key = ""
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        pass
+    if not api_key:
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+
+    if not api_key:
+        return None
+    return genai.Client(api_key=api_key)
 
 
 def is_ollama_running() -> bool:
-    """Checks if local Ollama server is active."""
-    if not OLLAMA_AVAILABLE:
-        return False
-    try:
-        ollama.list()
-        return True
-    except Exception:
-        return False
+    """Checks if Cloud Gemini AI is configured and ready (keeps compatibility with app.py)."""
+    return _get_gemini_client() is not None
 
 
-def _pick_models() -> tuple[str, str]:
-    """Selects (vision_model, medical_text_model) from installed Ollama models."""
-    vision_model = "qwen2.5vl:latest"
-    med_model = ""
-    try:
-        listing = ollama.list()
-        models = getattr(listing, "models", []) or []
-        names = [getattr(m, "model", "") for m in models]
-
-        for v_pref in ("qwen2.5vl:7b", "qwen2.5vl", "gemma3:12b", "gemma3:4b", "minicpm-v"):
-            for n in names:
-                if v_pref in n.lower():
-                    vision_model = n
-                    break
-            else:
-                continue
-            break
-
-        for n in names:
-            if "medgemma" in n.lower():
-                med_model = n
-                break
-    except Exception:
-        pass
-    return vision_model, med_model
-
-
-def preprocess_prescription_image(image_file, max_size: int = 1400) -> bytes:
-    """Keeps natural, high-resolution handwriting intact without artificial distortion."""
+def preprocess_prescription_image(image_file, max_size: int = 1600) -> bytes:
+    """Keeps natural, high-resolution handwriting intact."""
     img = Image.open(image_file)
     img = ImageOps.exif_transpose(img).convert("RGB")
     img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
@@ -60,7 +39,7 @@ def preprocess_prescription_image(image_file, max_size: int = 1400) -> bytes:
 
 
 def _extract_json(raw_text: str) -> dict:
-    """Safely extracts JSON from Ollama response."""
+    """Safely extracts JSON from AI response."""
     cleaned = raw_text.strip().replace("```json", "").replace("```", "").strip()
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if match:
@@ -69,151 +48,72 @@ def _extract_json(raw_text: str) -> dict:
     return json.loads(cleaned)
 
 
-def _clean_dosage(raw_d: str) -> str:
-    """Validates dosage schedule (e.g. 1+0+1) and replaces garbled Bengali OCR symbols cleanly."""
-    d = raw_d.strip()
-    if re.search(r"[0-9০-৯]\s*[\+\-\/]\s*[0-9০-৯]", d) and not any(bad in d for bad in ("√", "706", "700", "6/7", "67/8")):
-        return d
-    return "চলবে (চিকিৎসকের পরামর্শ অনুযায়ী)"
-
-
-
 def analyze_prescription(image_bytes: bytes) -> tuple[dict, str]:
     """
-    3-Band Zoomed Rx-Only Literal OCR:
-    Splits the Rx column into Top, Middle, and Bottom overlapping zoomed bands
-    so all 7 medicines (including Jovia Silver & Pantonix 20) are captured cleanly.
+    Analyzes handwritten or printed Bangladeshi prescriptions using Google Gemini 2.5 Flash.
+    Extracts doctor info, exact medicine brand names, dosages, and Bengali medical usage.
     """
-    if not is_ollama_running():
-        raise RuntimeError("লোকাল Ollama চালু নেই। অনুগ্রহ করে `ollama serve` চালু করুন।")
+    client = _get_gemini_client()
+    if not client:
+        raise RuntimeError(
+            "Gemini API Key সেট করা নেই। Streamlit Dashboard -> Settings -> Secrets-এ GEMINI_API_KEY যুক্ত করুন।"
+        )
 
-    vision_model, med_model = _pick_models()
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    w, h = img.size
+    prompt = """
+    You are an expert Bangladeshi pharmacist and medical OCR assistant.
+    Analyze this prescription image carefully and extract all details in valid JSON format.
 
-    def _to_jpeg(crop_img: Image.Image) -> bytes:
-        buf = io.BytesIO()
-        crop_img.save(buf, format="JPEG", quality=95)
-        return buf.getvalue()
+    Instructions:
+    1. Read the doctor's name, degrees, and chamber/hospital address from the header. If unclear or missing, write "উল্লেখ নেই".
+    2. Transcribe ALL handwritten or printed medicines accurately using their exact Bangladeshi brand names and strengths (e.g., Tab. Pantonix 20, Cap. Rivacap 3, Tab. Jovia Silver, Tab. Napa Extra). Do NOT replace brand names with generic names.
+    3. Extract the dosage schedule (e.g., "1+0+1", "১+০+১", "0+0+1 সকালে/রাতে খাবার পর"). If unreadable, write "চিকিৎসকের পরামর্শ অনুযায়ী".
+    4. For each medicine, write its true medical usage/indication in 1 simple, clear Bengali sentence (বাংলায়).
+    5. Provide a brief 1-2 sentence summary in Bengali.
 
-    # 1. Header crop (top 22%)
-    h_bytes = _to_jpeg(img.crop((0, 0, w, int(h * 0.22))))
+    Return ONLY raw JSON matching this exact structure:
+    {
+      "doctor_name": "string",
+      "doctor_degree": "string",
+      "chamber_address": "string",
+      "diagnosis": "string",
+      "medicines": [
+        {
+          "name": "Brand Name & Strength",
+          "usage": "কী কাজে লাগে (বাংলায়)",
+          "dosage": "খাবার নিয়ম"
+        }
+      ],
+      "summary": "সহজ সারাংশ (বাংলায়)"
+    }
+    """
 
-    
-    # 2. Three overlapping zoomed bands covering 100% of the Rx medicines without cutting any line
-    rx_top_bytes = _to_jpeg(img.crop((int(w * 0.28), int(h * 0.22), int(w * 0.98), int(h * 0.48))))
-    rx_mid_bytes = _to_jpeg(img.crop((int(w * 0.28), int(h * 0.42), int(w * 0.98), int(h * 0.68))))
-    rx_bot_bytes = _to_jpeg(img.crop((int(w * 0.28), int(h * 0.54), int(w * 0.98), int(h * 0.86))))
-
-
-   
-    # Read Doctor Header
-    h_res = ollama.chat(
-        model=vision_model,
-        messages=[{
-            "role": "user",
-            "content": "Read the doctor name, degrees, and hospital from this header. Reply in 3 lines:\nDoctor: ...\nDegree: ...\nHospital: ...",
-            "images": [h_bytes],
-        }],
-        keep_alive="5m",
-        options={"temperature": 0.0, "num_predict": 120},
-    )
-    h_text = getattr(getattr(h_res, "message", None), "content", "") or str(h_res)
-    doc_name, doc_deg, doc_hosp = "উল্লেখ নেই", "উল্লেখ নেই", "উল্লেখ নেই"
-    for line in h_text.splitlines():
-        clean = line.replace("**", "").strip()
-        if clean.lower().startswith("doctor:"):
-            doc_name = clean.partition(":")[-1].strip() or doc_name
-        elif clean.lower().startswith("degree:"):
-            doc_deg = clean.partition(":")[-1].strip() or doc_deg
-        elif clean.lower().startswith("hospital:"):
-            doc_hosp = clean.partition(":")[-1].strip() or doc_hosp
-
-    rx_prompt = (
-        "Perform literal character-by-character OCR on the handwritten medicine lines in this zoomed strip.\n"
-        "Transcribe the EXACT brand names and strengths written on the paper (e.g. Cap. Rivacap 3, Tab. Dementa 5, Tab. Syndopa 110, Tab. Queta XR 50, Cap. Uromax 0.4, Tab. Jovia Silver, Tab. Pantonix 20).\n"
-        "Do NOT replace brand names with generic chemical names.\n"
-        "Output ONE medicine per line in this exact format:\n"
-        "Brand Name & Strength | Dosage (e.g. 1+0+1)"
+    model_name = "gemini-2.5-flash"
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+            prompt,
+        ],
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
     )
 
-    def _read_band(b_data: bytes) -> list[dict]:
-        res = ollama.chat(
-            model=vision_model,
-            messages=[{"role": "user", "content": rx_prompt, "images": [b_data]}],
-            keep_alive="5m",
-            options={"temperature": 0.0, "repeat_penalty": 1.15, "num_predict": 350},
-        )
-        txt = getattr(getattr(res, "message", None), "content", "") or str(res)
-        items = []
-        skip_phrases = ("none", "blank", "no identifiable", "additional context", "please provide", "brand name", "sorry", "cannot")
-        for line in txt.splitlines():
-            clean = re.sub(r"^[\-\*\•\d\.\)\s]+", "", line.replace("**", "").strip())
-            if not clean or len(clean) < 3 or len(clean) > 65:
-                continue
-            if any(p in clean.lower() for p in skip_phrases):
-                continue
-            name_part, _, dose_part = clean.partition("|")
-            med_name = name_part.strip()
-            med_dose = _clean_dosage(dose_part)
-            if med_name and len(med_name) <= 45:
-                items.append({
-                    "name": med_name,
-                    "usage": "চিকিৎসকের নির্দেশিত ওষুধ",
-                    "dosage": med_dose,
-                })
-        return items
+    data = _extract_json(response.text)
+    medicines = data.get("medicines", [])
 
-
-    all_detected = _read_band(rx_top_bytes) + _read_band(rx_mid_bytes) + _read_band(rx_bot_bytes)
-
-    # Smart similarity deduplication (keeps all 7 distinct medicines, removes only true overlaps)
-    medicines = []
-    seen_names = []
-    for m in all_detected:
-        norm = re.sub(r"^(tab\.?|cap\.?|syp\.?|inj\.?)\s*", "", m["name"], flags=re.I).strip().lower()
-        if not norm:
-            continue
-        is_dup = any(difflib.SequenceMatcher(None, norm, prev).ratio() >= 0.78 for prev in seen_names)
-        if not is_dup:
-            seen_names.append(norm)
-            medicines.append(m)
-
-    # Add Bengali therapeutic usage using MedGemma (without altering medicine names or dosages)
-    usage_model = med_model or vision_model
-    if medicines:
-        names_only = "\n".join([f"{i+1}. {m['name']}" for i, m in enumerate(medicines)])
-        use_prompt = (
-            "You are a Bangladeshi pharmacist. For each numbered Bangladeshi medicine below, "
-            "write ONLY its numbered line with its true medical use in 1 short Bengali sentence (বাংলায়).\n"
-            "Example:\n1. স্মৃতিশক্তি ও ডিমেনশিয়া চিকিৎসায় ব্যবহৃত হয়।\n\n"
-            f"{names_only}"
-        )
-        u_res = ollama.chat(
-            model=usage_model,
-            messages=[{"role": "user", "content": use_prompt}],
-            keep_alive="5m",
-            options={"temperature": 0.0, "num_predict": 400},
-        )
-        u_text = getattr(getattr(u_res, "message", None), "content", "") or str(u_res)
-        for u_line in u_text.splitlines():
-            m_num = re.match(r"^(\d+)[\.\)\-\:]\s*(.+)", u_line.strip())
-            if m_num:
-                idx = int(m_num.group(1)) - 1
-                desc = m_num.group(2).strip()
-                if ":" in desc:
-                    desc = desc.partition(":")[-1].strip()
-                if 0 <= idx < len(medicines) and len(desc) > 5 and "example" not in desc.lower():
-                    medicines[idx]["usage"] = desc
-
-    return {
-        "doctor_name": doc_name,
-        "doctor_degree": doc_deg,
-        "chamber_address": doc_hosp,
-        "diagnosis": "প্রেসক্রিপশন অনুযায়ী",
+    result = {
+        "doctor_name": data.get("doctor_name") or "উল্লেখ নেই",
+        "doctor_degree": data.get("doctor_degree") or "উল্লেখ নেই",
+        "chamber_address": data.get("chamber_address") or "উল্লেখ নেই",
+        "diagnosis": data.get("diagnosis") or "প্রেসক্রিপশন অনুযায়ী",
         "medicines": medicines,
-        "summary": f"প্রেসক্রিপশন থেকে মোট {len(medicines)}টি ওষুধের নাম ও কার্যকারিতা পড়া হয়েছে।",
-    }, f"3-Band Zoomed OCR ({vision_model})"
+        "summary": data.get("summary")
+        or f"প্রেসক্রিপশন থেকে মোট {len(medicines)}টি ওষুধের নাম ও কার্যকারিতা পড়া হয়েছে।",
+    }
+
+    return result, f"Cloud Vision AI ({model_name})"
 
 
 def _fallback_clinical_diet(patient_data: dict) -> dict:
