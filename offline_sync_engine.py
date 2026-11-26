@@ -96,8 +96,8 @@ def analyze_prescription(image_bytes: bytes) -> tuple[dict, str]:
         ],
         config=types.GenerateContentConfig(
             temperature=0.1,
-            response_mime_type="application/json",
         ),
+
     )
 
     data = _extract_json(response.text)
