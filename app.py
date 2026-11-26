@@ -27,10 +27,10 @@ st.set_page_config(
 
 with st.sidebar:
     st.title("🩺 স্বাস্থ্যবন্ধু AI")
-    st.caption("১০০% ফ্রি ও API Key মুক্ত ডিজিটাল স্বাস্থ্য সহায়ক")
+    st.caption("১০০% ফ্রি ও স্মার্ট ডিজিটাল স্বাস্থ্য সহায়ক")
     st.divider()
 
-st.subheader("⚙️ AI স্ট্যাটাস")
+    st.subheader("⚙️ AI স্ট্যাটাস")
     if is_ollama_running():
         st.success("🟢 Cloud Vision AI সক্রিয়")
     else:
@@ -251,6 +251,7 @@ with tab2:
                 type="primary",
                 width="stretch",
             )
+
 # ==========================================
 # TAB 3: 64 DISTRICT HOSPITAL FINDER
 # ==========================================
